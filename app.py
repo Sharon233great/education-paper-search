@@ -1,221 +1,186 @@
-# app.py — 学术快搜（教育领域优先）
+# app.py
+# 教育科技 & 高等教育 — 专业期刊搜索（含：近5年过滤 / Q1 近似 / 按引用排序 / 高频作者排行）
+# 数据源：OpenAlex
 import streamlit as st
 import requests
-import feedparser
-from urllib.parse import quote_plus
-from dateutil import parser as dateparser
 from datetime import datetime
+from collections import Counter
 
-st.set_page_config(page_title="教育领域学术快搜", layout="wide")
-st.title("📚 教育领域学术快搜")
-st.markdown("输入关键词，点“搜索”即可抓取最新教育领域论文（来自 arXiv + Crossref；可选 Semantic Scholar）。无需发送邮件，只在页面展示。")
+st.set_page_config(page_title="教育科技 & 高等教育 · 期刊搜索", layout="wide")
+st.title("🎓 教育科技 & 高等教育 — 期刊搜索（专业版）")
+st.markdown(
+    "数据来源：OpenAlex（开放学术索引）。\n\n"
+    "- 默认只看近 5 年（可修改）。\n"
+    "- “只看 Q1（近似）”使用论文的 `citation_normalized_percentile >= 阈值` 作为近似标准。\n"
+    "- 可按引用次数排序以看到影响力更高的论文。\n\n"
+    "（建议注册 OpenAlex API Key 并填写以获得更稳定配额，参见 https://docs.openalex.org/ ）"
+)
 
-# --- UI 设置 ---
-keyword = st.text_input("关键词（示例：education, STEM education, pedagogy, teacher professional development）", value="education")
-education_only = st.checkbox("只显示教育相关（自动过滤）", value=True)
-sources = st.multiselect("来源（默认两项）", ["arXiv", "Crossref", "SemanticScholar"], default=["arXiv", "Crossref"])
-max_results = st.slider("每个来源最多显示多少条？", min_value=5, max_value=50, value=10)
-semanticscholar_api_key = st.text_input("（可选）Semantic Scholar API Key（没有可以留空）", value="", type="password")
+# ---------------- UI 控件 ----------------
+keyword = st.text_input("请输入关键词（例如：AI in higher education）", value="educational technology")
+max_results = st.slider("每次最多显示多少篇？", 5, 50, 15)
+only_recent = st.checkbox("只看近 5 年论文（默认）", value=True)
+recent_years = st.number_input("近 N 年（当勾选“只看近 5 年”时有效）", min_value=1, max_value=10, value=5)
+only_q1 = st.checkbox("只看 Q1（近似：高被引论文）", value=False)
+q1_threshold = st.slider("Q1 近似阈值（归一化引用百分位，越高越严格）", 50, 99, 75)
+sort_by_citations = st.checkbox("按引用次数排序（从高到低）", value=True)
+openalex_api_key = st.text_input("（可选）OpenAlex API Key（没有可留空）", type="password")
 
-# 简单 session 缓存避免短时间内重复请求
-if 'cache' not in st.session_state:
-    st.session_state.cache = {}
+st.markdown("---")
+st.caption("提示：OpenAlex 非必需 API Key，但有 key 会更稳定。")
 
-def cached_get(key, ttl_seconds=300):
-    now = datetime.utcnow()
-    entry = st.session_state.cache.get(key)
-    if entry and (now - entry['time']).total_seconds() < ttl_seconds:
-        return entry['value']
-    return None
-
-def cached_set(key, value):
-    st.session_state.cache[key] = {'time': datetime.utcnow(), 'value': value}
-
-# 教育相关词表，用于简单过滤（可根据需要扩充）
-EDU_KEYWORDS = [
-    "education","educational","learning","pedagogy","teaching","teacher","curriculum",
-    "k-12","primary school","secondary school","higher education","university",
-    " STEM education", "STEM", "instruction","professional development","classroom",
-    "school", "students", "student learning", "MOOC", "online learning", "blended learning"
-]
-
-def looks_education_like(title, summary, venue=None):
-    """简单规则：若标题/摘要/刊物名包含教育关键字，则认为与教育相关"""
-    text = " ".join(filter(None, [title or "", summary or "", venue or ""])).lower()
-    for kw in EDU_KEYWORDS:
-        if kw.strip() and kw.lower() in text:
-            return True
-    return False
-
-# ------- arXiv 查询 -------
-def query_arxiv(q, max_results=10):
-    q_enc = quote_plus(q)
-    url = f"http://export.arxiv.org/api/query?search_query=all:{q_enc}&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
-    cache_key = f"arxiv:{q}:{max_results}"
-    cached = cached_get(cache_key, ttl_seconds=300)
-    if cached:
-        return cached
-    resp = requests.get(url, timeout=20)
-    feed = feedparser.parse(resp.text)
-    results = []
-    for entry in feed.entries:
-        authors = [a.name for a in entry.get('authors', [])] if 'authors' in entry else []
-        summary = entry.get('summary', '').replace('\n', ' ').strip()
-        results.append({
-            'source': 'arXiv',
-            'id': entry.get('id'),
-            'title': entry.get('title', '').replace('\n', ' ').strip(),
-            'authors': authors,
-            'summary': summary,
-            'published': entry.get('published'),
-            'link': entry.get('id'),
-            'venue': entry.get('arxiv_primary_category', {}).get('term') if isinstance(entry.get('arxiv_primary_category'), dict) else None
-        })
-    cached_set(cache_key, results)
-    return results
-
-# ------- Crossref 查询 -------
-def query_crossref(q, max_results=10, mailto="your-email@example.com"):
-    cache_key = f"crossref:{q}:{max_results}"
-    cached = cached_get(cache_key, ttl_seconds=300)
-    if cached:
-        return cached
+# ---------------- helper functions ----------------
+def openalex_search(query, per_page=15, api_key=None):
+    """调用 OpenAlex /works API，返回 results 列表"""
+    base = "https://api.openalex.org/works"
     params = {
-        "query.bibliographic": q,
-        "rows": max_results,
-        "mailto": mailto
+        "search": query,
+        "filter": "type:journal-article",
+        "per-page": per_page,
+        "sort": "publication_date:desc"
     }
-    url = "https://api.crossref.org/works"
-    resp = requests.get(url, params=params, timeout=20)
-    results = []
-    if resp.status_code == 200:
-        data = resp.json().get("message", {}).get("items", [])
-        for item in data:
-            title = item.get('title', [''])[0]
-            authors = []
-            for a in item.get('author', [])[:10]:
-                name = " ".join(filter(None, [a.get('given'), a.get('family')]))
-                authors.append(name)
-            published = None
-            if item.get('issued'):
-                dp = item['issued'].get('date-parts', [[None]])[0]
-                published = "-".join(str(x) for x in dp if x is not None)
-            abstract = item.get('abstract') or ""
-            doi = item.get('DOI')
-            venue = item.get('container-title', [''])[0] if item.get('container-title') else None
-            link = f"https://doi.org/{doi}" if doi else item.get('URL')
-            results.append({
-                'source': 'Crossref',
-                'title': title,
-                'authors': authors,
-                'summary': abstract,
-                'published': published,
-                'link': link,
-                'doi': doi,
-                'venue': venue
-            })
-    cached_set(cache_key, results)
-    return results
-
-# ------- Semantic Scholar 查询（可选） -------
-def query_semanticscholar(q, max_results=10, api_key=None):
-    cache_key = f"semanticscholar:{q}:{max_results}"
-    cached = cached_get(cache_key, ttl_seconds=300)
-    if cached:
-        return cached
     headers = {}
     if api_key:
-        headers['x-api-key'] = api_key
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
-        "query": q,
-        "limit": max_results,
-        "fields": "title,abstract,authors,url,year,venue,externalIds"
-    }
-    resp = requests.get(url, params=params, headers=headers, timeout=20)
-    results = []
-    if resp.status_code == 200:
-        data = resp.json().get('data', [])
-        for item in data:
-            authors = [a.get('name') for a in item.get('authors', [])]
-            results.append({
-                'source': 'SemanticScholar',
-                'title': item.get('title'),
-                'authors': authors,
-                'summary': item.get('abstract', ''),
-                'published': item.get('year'),
-                'link': item.get('url'),
-                'venue': item.get('venue')
-            })
-    cached_set(cache_key, results)
-    return results
+        headers["Authorization"] = f"Bearer {api_key}"
+    resp = requests.get(base, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("results", [])
 
-# ------- 搜索按钮处理 -------
+def looks_recent(publication_date_str, years):
+    """判断 publication_date_str（YYYY-MM-DD 或 YYYY）是否在最近 years 年内"""
+    if not publication_date_str:
+        return False
+    try:
+        year = int(publication_date_str.split("-")[0])
+    except Exception:
+        return False
+    this_year = datetime.utcnow().year
+    return year >= (this_year - years + 1)
+
+def reconstruct_abstract(inv_index):
+    """尝试把 OpenAlex 的 inverted index 摘要重建成文本（若存在）"""
+    try:
+        toks = {}
+        for token, positions in inv_index.items():
+            for p in positions:
+                toks[p] = token
+        text = " ".join([toks[i] for i in sorted(toks.keys())])
+        return text
+    except Exception:
+        return None
+
+# ---------------- 搜索与展示 ----------------
 if st.button("🔎 搜索"):
     if not keyword.strip():
         st.warning("请先输入关键词。")
     else:
-        with st.spinner("正在抓取并过滤教育相关论文……"):
-            all_results = []
-            # arXiv
-            if "arXiv" in sources:
-                try:
-                    arxiv_res = query_arxiv(keyword, max_results=max_results)
-                except Exception as e:
-                    st.error(f"arXiv 查询出错: {e}")
-                    arxiv_res = []
-                # 过滤（如果选择教育优先）
-                if education_only:
-                    arxiv_res = [r for r in arxiv_res if looks_education_like(r['title'], r['summary'], r.get('venue'))]
-                all_results.extend(arxiv_res)
-                if arxiv_res:
-                    st.subheader("arXiv（已过滤）" if education_only else "arXiv")
-                    for r in arxiv_res:
-                        st.markdown(f"**{r['title']}**  \n作者: {', '.join(r['authors'])}  \n发布时间: {r.get('published')}  \n[{r['link']}]({r['link']})")
-                        st.write(r['summary'][:800] + ("…" if len(r['summary'])>800 else ""))
-                        st.markdown("---")
+        with st.spinner("正在从 OpenAlex 抓取并应用筛选（请稍候）..."):
+            try:
+                results = openalex_search(keyword, per_page=max_results, api_key=openalex_api_key or None)
+            except Exception as e:
+                st.error(f"调用 OpenAlex 出错：{e}")
+                results = []
 
-            # Crossref
-            if "Crossref" in sources:
-                try:
-                    cr_res = query_crossref(keyword, max_results=max_results, mailto="your-email@example.com")
-                except Exception as e:
-                    st.error(f"Crossref 查询出错: {e}")
-                    cr_res = []
-                if education_only:
-                    cr_res = [r for r in cr_res if looks_education_like(r['title'], r.get('summary',''), r.get('venue'))]
-                all_results.extend(cr_res)
-                if cr_res:
-                    st.subheader("Crossref（已过滤）" if education_only else "Crossref")
-                    for r in cr_res:
-                        st.markdown(f"**{r['title']}**  \n作者: {', '.join(r['authors'])}  \n刊物/会议: {r.get('venue')}  \n链接: {r.get('link')}")
-                        if r.get('summary'):
-                            # Crossref 有时候返回 HTML abstract；避免渲染过长
-                            st.write(r['summary'][:800] + ("…" if len(r['summary'])>800 else ""))
-                        st.markdown("---")
+            if not results:
+                st.info("未找到结果（或 API 限制导致未返回）。")
+            else:
+                # 过滤与去重
+                filtered = []
+                seen = set()
+                for r in results:
+                    doi = (r.get("ids") or {}).get("doi")
+                    title = (r.get("title") or "").strip()
+                    key = (doi or title)[:300]
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
-            # Semantic Scholar
-            if "SemanticScholar" in sources:
-                try:
-                    ss_res = query_semanticscholar(keyword, max_results=max_results, api_key=semanticscholar_api_key or None)
-                except Exception as e:
-                    st.error(f"Semantic Scholar 查询出错: {e}")
-                    ss_res = []
-                if education_only:
-                    ss_res = [r for r in ss_res if looks_education_like(r['title'], r.get('summary',''), r.get('venue'))]
-                all_results.extend(ss_res)
-                if ss_res:
-                    st.subheader("Semantic Scholar（已过滤）" if education_only else "Semantic Scholar")
-                    for r in ss_res:
-                        st.markdown(f"**{r['title']}**  \n作者: {', '.join(r['authors'])}  \n刊物/年份: {r.get('venue')} {r.get('published')}  \n链接: {r.get('link')}")
-                        st.write((r.get('summary') or "")[:800] + ("…" if (r.get('summary') or "")>800 else ""))
-                        st.markdown("---")
+                    # 近年过滤
+                    pub_date = r.get("publication_date") or ""
+                    if only_recent:
+                        if not looks_recent(pub_date, recent_years):
+                            continue
 
-        st.success(f"完成 — 共收集到 {len(all_results)} 条（可能存在重复）")
-        # 简单去重（按 link 或 title）
-        dedup = {}
-        for r in all_results:
-            key = (r.get('link') or r.get('title'))[:200]
-            if key not in dedup:
-                dedup[key] = r
-        st.info(f"去重后结果：{len(dedup)} 条。页面顶部已按来源分组显示。")
+                    # Q1 近似过滤：使用 citation_normalized_percentile（若无则排除）
+                    if only_q1:
+                        cnp = r.get("citation_normalized_percentile")
+                        try:
+                            cnp_val = float(cnp) if cnp is not None else None
+                        except Exception:
+                            cnp_val = None
+                        if cnp_val is None or cnp_val < q1_threshold:
+                            continue
+
+                    filtered.append(r)
+
+                # 排序
+                if sort_by_citations:
+                    filtered.sort(key=lambda x: x.get("cited_by_count", 0), reverse=True)
+                else:
+                    filtered.sort(key=lambda x: x.get("publication_date") or "", reverse=True)
+
+                st.success(f"抓取完成 — 原始返回 {len(results)} 条，筛选后 {len(filtered)} 条（去重后）")
+
+                # 显示论文详情
+                for r in filtered:
+                    title = r.get("title") or "无标题"
+                    pub_date = r.get("publication_date") or "未知"
+                    journal = (r.get("primary_location") or {}).get("source", {}).get("display_name") \
+                              or r.get("host_venue", {}).get("display_name") or "未知期刊"
+                    citation = r.get("cited_by_count", 0)
+                    cnp = r.get("citation_normalized_percentile", "N/A")
+                    doi = (r.get("ids") or {}).get("doi")
+                    url = (r.get("primary_location") or {}).get("landing_page_url") or r.get("id") or ""
+                    authors_list = []
+                    for a in r.get("authorships", [])[:10]:
+                        # OpenAlex authorship object 有 "author" 或直接 display_name
+                        if isinstance(a, dict):
+                            au = a.get("author") or {}
+                            name = au.get("display_name") or a.get("display_name")
+                        else:
+                            name = None
+                        if name:
+                            authors_list.append(name)
+                    authors = ", ".join(authors_list) if authors_list else "未知作者"
+
+                    st.markdown(f"### {title}")
+                    st.markdown(f"📘 期刊：{journal}    📅 发表时间：{pub_date}")
+                    st.markdown(f"👥 作者：{authors}")
+                    st.markdown(f"📈 引用次数：{citation}    |    归一化引用百分位 (近似 Q1)：{cnp}")
+                    if doi:
+                        st.markdown(f"🔗 DOI: https://doi.org/{doi}")
+                    if url:
+                        st.markdown(f"[🔎 打开论文页面]({url})")
+                    # 摘要（若存在 inverted index）
+                    abstract_inv = r.get("abstract_inverted_index")
+                    if abstract_inv:
+                        text = reconstruct_abstract(abstract_inv)
+                        if text:
+                            st.write(text[:1000] + ("…" if len(text) > 1000 else ""))
+                    # 横线分隔
+                    st.markdown("---")
+
+                # ===== 统计作者出现次数并显示排行榜 =====
+                author_counter = Counter()
+                for r in filtered:
+                    for a in r.get("authorships", []):
+                        if isinstance(a, dict):
+                            au = a.get("author") or {}
+                            name = au.get("display_name") or a.get("display_name")
+                        else:
+                            name = None
+                        if name:
+                            author_counter[name] += 1
+
+                if author_counter:
+                    st.markdown("## 📊 本次搜索 · 高频作者排行")
+                    st.markdown("（按本次搜索结果中作者出现次数统计）")
+                    for name, count in author_counter.most_common(20):
+                        st.write(f"{name} — 出现 {count} 次")
+                    st.markdown("---")
+
+                # 可选：显示总体统计（比如总引用数等）
+                total_citations = sum([r.get("cited_by_count", 0) for r in filtered])
+                st.caption(f"筛选后论文数：{len(filtered)}，总引用次数：{total_citations}")
+
